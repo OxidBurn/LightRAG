@@ -950,7 +950,9 @@ class PGGraphStorage(BaseGraphStorage):
                             vertices.get(edge["end_id"], {}),
                         )
             else:
-                if v is None or (v.count("{") < 1 and v.count("[") < 1):
+                if v is None:
+                    d[k] = v
+                elif isinstance(v, str) and (v.count("{") < 1 and v.count("[") < 1):
                     d[k] = v
                 else:
                     d[k] = json.loads(v) if isinstance(v, str) else v
@@ -1556,7 +1558,7 @@ TABLES = {
                     content_vector VECTOR,
                     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP,
-                    chunk_id VARCHAR(255) NULL,
+                    chunk_id TEXT NULL,
 	                CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
                     )"""
     },
@@ -1570,7 +1572,7 @@ TABLES = {
                     content_vector VECTOR,
                     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP,
-                    chunk_id VARCHAR(255) NULL,
+                    chunk_id TEXT NULL,
 	                CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
                     )"""
     },
