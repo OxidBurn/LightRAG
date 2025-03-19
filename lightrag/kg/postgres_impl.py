@@ -846,8 +846,6 @@ class PGGraphQueryException(Exception):
 class PGGraphStorage(BaseGraphStorage):
     def __post_init__(self):
         self.graph_name = self.namespace or os.environ.get("AGE_GRAPH_NAME", "lightrag")
-        print(f"[849] Graph name: {self.graph_name}")
-        print(f"Namespace: {self.namespace}")
         self._node_embed_algorithms = {
             "node2vec": self._node2vec_embed,
         }
@@ -1070,7 +1068,6 @@ class PGGraphStorage(BaseGraphStorage):
         """
         try:
             if readonly:
-                logger.debug(f"[1073] Graph name: {self.graph_name}")
                 data = await self.db.query(
                     query,
                     multirows=True,
@@ -1078,7 +1075,6 @@ class PGGraphStorage(BaseGraphStorage):
                     graph_name=self.graph_name,
                 )
             else:
-                logger.debug(f"[1082] Graph name: {self.graph_name}")
                 data = await self.db.execute(
                     query,
                     upsert=upsert,
@@ -1105,7 +1101,6 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def has_node(self, node_id: str) -> bool:
         entity_name_label = self._encode_graph_label(node_id.strip('"'))
-        logger.debug(f"[1108] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity {node_id: "%s"})
                      RETURN count(n) > 0 AS node_exists
@@ -1118,7 +1113,6 @@ class PGGraphStorage(BaseGraphStorage):
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         src_label = self._encode_graph_label(source_node_id.strip('"'))
         tgt_label = self._encode_graph_label(target_node_id.strip('"'))
-        logger.debug(f"[1121] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (a:Entity {node_id: "%s"})-[r]-(b:Entity {node_id: "%s"})
                      RETURN COUNT(r) > 0 AS edge_exists
@@ -1134,7 +1128,6 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         label = self._encode_graph_label(node_id.strip('"'))
-        logger.debug(f"[1137] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity {node_id: "%s"})
                      RETURN n
@@ -1149,7 +1142,6 @@ class PGGraphStorage(BaseGraphStorage):
 
     async def node_degree(self, node_id: str) -> int:
         label = self._encode_graph_label(node_id.strip('"'))
-        logger.debug(f"[1152] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity {node_id: "%s"})-[]->(x)
                      RETURN count(x) AS total_edge_count
@@ -1177,7 +1169,6 @@ class PGGraphStorage(BaseGraphStorage):
     ) -> dict[str, str] | None:
         src_label = self._encode_graph_label(source_node_id.strip('"'))
         tgt_label = self._encode_graph_label(target_node_id.strip('"'))
-        logger.debug(f"[1180] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (a:Entity {node_id: "%s"})-[r]->(b:Entity {node_id: "%s"})
                      RETURN properties(r) as edge_properties
@@ -1199,7 +1190,6 @@ class PGGraphStorage(BaseGraphStorage):
         :return: list of dictionaries containing edge information
         """
         label = self._encode_graph_label(source_node_id.strip('"'))
-        logger.debug(f"[1202] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                       MATCH (n:Entity {node_id: "%s"})
                       OPTIONAL MATCH (n)-[]-(connected)
@@ -1244,7 +1234,6 @@ class PGGraphStorage(BaseGraphStorage):
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         label = self._encode_graph_label(node_id.strip('"'))
         properties = node_data
-        logger.debug(f"[1247] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MERGE (n:Entity {node_id: "%s"})
                      SET n += %s
@@ -1281,7 +1270,6 @@ class PGGraphStorage(BaseGraphStorage):
         src_label = self._encode_graph_label(source_node_id.strip('"'))
         tgt_label = self._encode_graph_label(target_node_id.strip('"'))
         edge_properties = edge_data
-        logger.debug(f"[1284] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (source:Entity {node_id: "%s"})
                      WITH source
@@ -1314,7 +1302,6 @@ class PGGraphStorage(BaseGraphStorage):
             node_id (str): The ID of the node to delete.
         """
         label = self._encode_graph_label(node_id.strip('"'))
-        logger.debug(f"[1317] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity {node_id: "%s"})
                      DETACH DELETE n
@@ -1337,7 +1324,6 @@ class PGGraphStorage(BaseGraphStorage):
             self._encode_graph_label(node_id.strip('"')) for node_id in node_ids
         ]
         node_id_list = ", ".join([f'"{node_id}"' for node_id in encoded_node_ids])
-        logger.debug(f"[1340] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity)
                      WHERE n.node_id IN [%s]
@@ -1365,7 +1351,6 @@ class PGGraphStorage(BaseGraphStorage):
             for src, tgt in edges
         ]
         edge_list = ", ".join([f'["{src}", "{tgt}"]' for src, tgt in encoded_edges])
-        logger.debug(f"[1368] Graph name: {self.graph_name}")
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (a:Entity)-[r]->(b:Entity)
                      WHERE [a.node_id, b.node_id] IN [%s]
@@ -1385,7 +1370,6 @@ class PGGraphStorage(BaseGraphStorage):
         Returns:
             list[str]: A list of all labels in the graph.
         """
-        logger.debug(f"[1388] Graph name: {self.graph_name}")
         query = (
             """SELECT * FROM cypher('%s', $$
                      MATCH (n:Entity)
@@ -1431,7 +1415,6 @@ class PGGraphStorage(BaseGraphStorage):
             KnowledgeGraph: The retrieved subgraph.
         """
         MAX_GRAPH_NODES = 1000
-        logger.debug(f"[1434] Graph name: {self.graph_name}")
         if node_label == "*":
             query = """SELECT * FROM cypher('%s', $$
                          MATCH (n:Entity)
@@ -1443,7 +1426,6 @@ class PGGraphStorage(BaseGraphStorage):
                 MAX_GRAPH_NODES,
             )
         else:
-            logger.debug(f"[1446] Graph name: {self.graph_name}")
             encoded_node_label = self._encode_graph_label(node_label.strip('"'))
             query = """SELECT * FROM cypher('%s', $$
                          MATCH (n:Entity {node_id: "%s"})
