@@ -8,7 +8,8 @@ from typing import Optional, List, Tuple
 import sys
 from ascii_colors import ASCIIColors
 import logging
-from lightrag.api import __api_version__
+from lightrag.api import __api_version__ as api_version
+from lightrag import __version__ as core_version
 from fastapi import HTTPException, Security, Request, status
 from dotenv import load_dotenv
 from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
@@ -23,9 +24,7 @@ def check_env_file():
     Returns True if should continue, False if should exit.
     """
     if not os.path.exists(".env"):
-        warning_msg = (
-            "Warning: .env file not found. Some features may not work properly."
-        )
+        warning_msg = "Warning: Startup directory must contain .env file for multi-instance support."
         ASCIIColors.yellow(warning_msg)
 
         # Check if running in interactive terminal
@@ -37,8 +36,10 @@ def check_env_file():
     return True
 
 
-# Load environment variables
-load_dotenv()
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+load_dotenv(dotenv_path=".env", override=False)
 
 global_args = {"main_args": None}
 
@@ -488,7 +489,7 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     # Banner
     ASCIIColors.cyan(f"""
     ╔══════════════════════════════════════════════════════════════╗
-    ║                   🚀 LightRAG Server v{__api_version__}                  ║
+    ║                   🚀 LightRAG Server v{core_version}/{api_version}            ║
     ║          Fast, Lightweight RAG Server Implementation         ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
