@@ -1009,7 +1009,6 @@ async def mix_kg_vector_query(
         )
 
     # 2. Execute knowledge graph and vector searches in parallel
-    @performance
     async def get_kg_context():
         try:
             hl_keywords, ll_keywords = await get_keywords_from_query(
@@ -1053,7 +1052,6 @@ async def mix_kg_vector_query(
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
-    @performance
     async def get_vector_context():
         # Consider conversation history in vector search
         augmented_query = query
@@ -1189,7 +1187,6 @@ async def mix_kg_vector_query(
 
     return response
 
-@performance
 async def _build_query_context(
     ll_keywords: str,
     hl_keywords: str,
@@ -1201,7 +1198,6 @@ async def _build_query_context(
 ):
     logger.info(f"Process {os.getpid()} buidling query context...")
     if query_param.mode == "local":
-        print(Fore.MAGENTA + "Local mode")
         entities_context, relations_context, text_units_context = await _get_node_data(
             ll_keywords,
             knowledge_graph_inst,
@@ -1210,7 +1206,6 @@ async def _build_query_context(
             query_param,
         )
     elif query_param.mode == "global":
-        print(Fore.YELLOW + "Global mode")
         entities_context, relations_context, text_units_context = await _get_edge_data(
             hl_keywords,
             knowledge_graph_inst,
@@ -1219,7 +1214,6 @@ async def _build_query_context(
             query_param,
         )
     else:  # hybrid mode
-        print(Fore.CYAN + "Hybrid mode")
         ll_data, hl_data = await asyncio.gather(
             _get_node_data(
                 ll_keywords,
@@ -1295,7 +1289,6 @@ async def _build_query_context(
     """.strip()
     return result
 
-@performance
 async def _get_node_data(
     query: str,
     knowledge_graph_inst: BaseGraphStorage,
@@ -1452,7 +1445,6 @@ async def _get_node_data(
     text_units_context = list_of_list_to_csv(text_units_section_list)
     return entities_context, relations_context, text_units_context
 
-@performance
 async def _find_most_related_text_unit_from_entities(
     node_datas: list[dict],
     edges_map: dict[str, list[tuple]],
@@ -1570,7 +1562,6 @@ async def _find_most_related_text_unit_from_entities(
     
     return [t["data"] for t in all_text_units]
 
-@performance
 async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
     edges_map: dict[str, list[tuple]],
@@ -1631,7 +1622,6 @@ async def _find_most_related_edges_from_entities(
     
     return all_edges_data
 
-@performance
 async def _get_edge_data(
     keywords,
     knowledge_graph_inst: BaseGraphStorage,
