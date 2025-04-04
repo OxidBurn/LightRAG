@@ -14,7 +14,6 @@ Config File Options (config.ini):
     statement_cache_size = 200           # Number of prepared statements to cache
 """
 import asyncio
-from functools import lru_cache
 import json
 import os
 import time
@@ -25,7 +24,6 @@ import configparser
 
 from lightrag.prompt import GRAPH_FIELD_SEP
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from .performance import performance
 
 import sys
 from tenacity import (
@@ -45,10 +43,6 @@ from ..base import (
 )
 from ..namespace import NameSpace, is_namespace
 from ..utils import logger
-
-from colorama import init, Fore
-
-init(autoreset=True)
 
 if sys.platform.startswith("win"):
     import asyncio.windows_events
@@ -652,7 +646,6 @@ class ClientManager:
         return db
 
     @classmethod
-    @performance
     async def get_client(cls) -> PostgreSQLDB:
         """Get a client from the shared pool with optimized connection handling"""
         # Configure timeout and retries
@@ -1692,7 +1685,6 @@ class PGGraphStorage(BaseGraphStorage):
             logger.warning(f"Edge existence check failed for {source_node_id} -> {target_node_id}: {e}")
             return False
 
-    @performance
     async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
         """Get multiple nodes in a single query"""
         if not node_ids:
@@ -1740,7 +1732,6 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"Error in batch node retrieval: {e}")
             return {}
     
-    @performance
     async def get_edges_batch(self, edge_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
         """Get multiple edges in a single query"""
         if not edge_pairs:
@@ -1786,7 +1777,6 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"Error in batch edge retrieval: {e}")
             return {}
 
-    @performance
     async def get_node_edges_batch(self, node_ids: list[str]) -> dict[str, list[tuple[str, str]]]:
         """Get edges for multiple nodes in a single query"""
         if not node_ids:
@@ -1906,7 +1896,6 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"Error in batch edge degree retrieval: {e}")
             return {edge: 0 for edge in edge_pairs}
     
-    @performance
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         """Get node with caching"""
         cache_key = node_id
@@ -1960,11 +1949,9 @@ class PGGraphStorage(BaseGraphStorage):
 
         return degrees
 
-    @performance
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
-        print(Fore.BLUE + f"get_edge: {source_node_id} -> {target_node_id}")
         try:
             src_label = self._encode_graph_label(source_node_id.strip('"'))
             tgt_label = self._encode_graph_label(target_node_id.strip('"'))
@@ -1989,13 +1976,11 @@ class PGGraphStorage(BaseGraphStorage):
             logger.error(f"Error getting edge {source_node_id} -> {target_node_id}: {e}")
             return None
 
-    @performance
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]]:
       """
       Retrieves all edges (relationships) for a particular node identified by its label.
       :return: list of tuples containing (source, target) node IDs
       """
-      print(Fore.BLUE + f"get_node_edges: {source_node_id}")
       try:
           label = self._encode_graph_label(source_node_id.strip('"'))
           
