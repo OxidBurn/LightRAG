@@ -1,4 +1,20 @@
+"""
+PostgreSQL implementation for LightRAG storage components.
+
+Environment Variables:
+    LIGHTRAG_SKIP_SCHEMA: Set to "1", "true", or "yes" to skip schema validation for faster startup in production
+    LIGHTRAG_PRODUCTION: Set to "1", "true", or "yes" to enable production optimizations
+    POSTGRES_CONN_TIMEOUT: Connection timeout in seconds (default: 10.0)
+    POSTGRES_STMT_CACHE_SIZE: Number of prepared statements to cache (default: 200)
+
+Config File Options (config.ini):
+    [postgres]
+    skip_schema_validation = true/false  # Skip schema validation
+    connection_timeout = 10.0            # Connection timeout in seconds
+    statement_cache_size = 200           # Number of prepared statements to cache
+"""
 import asyncio
+from functools import lru_cache
 import json
 import os
 import time
@@ -9,6 +25,7 @@ import configparser
 
 from lightrag.prompt import GRAPH_FIELD_SEP
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
+from .performance import performance
 
 from tenacity import (
     retry,
@@ -41,6 +58,10 @@ MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000))
 
 
 class PostgreSQLDB:
+    # Class-level configuration for faster startup
+    SKIP_SCHEMA_VALIDATION = os.environ.get("LIGHTRAG_SKIP_SCHEMA", "").lower() in ("1", "true", "yes")
+    PRODUCTION_MODE = os.environ.get("LIGHTRAG_PRODUCTION", "").lower() in ("1", "true", "yes") 
+    
     def __init__(self, config: dict[str, Any], **kwargs: Any):
         self.host = config.get("host", "localhost")
         self.port = config.get("port", 5432)
@@ -48,28 +69,60 @@ class PostgreSQLDB:
         self.password = config.get("password", None)
         self.database = config.get("database", "postgres")
         self.workspace = config.get("workspace", "default")
-        self.max = 12
-        self.increment = 1
+        self.max = 10  # Reduced from 12 for better resource management
+        self.min = 2   # Keep some connections alive
         self.pool: Pool | None = None
+        self.statement_cache_size = 200  # Cache prepared statements
+        self.init_complete = False
+        self.tables_checked = False
+        self.connection_timeout = 10.0  # seconds
+        self.command_timeout = 60.0     # seconds
+        
+        # Override from config
+        self.skip_schema_validation = config.get("skip_schema_validation", self.SKIP_SCHEMA_VALIDATION)
+        
+        # Connection options for better performance
+        self.connection_options = {
+            "server_settings": {
+                "application_name": "LightRAG",
+                "search_path": "public",
+                "statement_timeout": "60000",  # milliseconds
+                "idle_in_transaction_session_timeout": "300000"  # 5 min
+            }
+        }
 
         if self.user is None or self.password is None or self.database is None:
             raise ValueError("Missing database user, password, or database")
+            
+        if self.skip_schema_validation:
+            logger.info("Schema validation is disabled - tables will not be checked")
+            self.tables_checked = True
 
     async def initdb(self):
         try:
+            if self.pool is not None and not self.pool._closed:
+                logger.debug("Connection pool already exists, reusing")
+                return
+                
+            logger.info(f"Creating connection pool to {self.host}:{self.port}/{self.database}")
             self.pool = await asyncpg.create_pool(  # type: ignore
                 user=self.user,
                 password=self.password,
                 database=self.database,
                 host=self.host,
                 port=self.port,
-                min_size=1,
+                min_size=self.min,
                 max_size=self.max,
+                command_timeout=self.command_timeout,
+                statement_cache_size=self.statement_cache_size,
+                timeout=self.connection_timeout,
+                **self.connection_options
             )
 
             logger.info(
                 f"PostgreSQL, Connected to database at {self.host}:{self.port}/{self.database}"
             )
+            self.init_complete = True
         except Exception as e:
             logger.error(
                 f"PostgreSQL, Failed to connect database at {self.host}:{self.port}/{self.database}, Got:{e}"
@@ -99,113 +152,284 @@ class PostgreSQLDB:
         ):
             pass
 
+    async def execute_raw(self, sql: str):
+        """Execute SQL directly without prepared statement"""
+        if self.pool is None or self.pool._closed:
+            await self.initdb()
+            
+        try:
+            async with self.pool.acquire() as connection:
+                await connection.execute(sql)
+                return True
+        except Exception as e:
+            logger.error(f"Error executing raw SQL: {e}")
+            return False
+    
+    async def get_existing_tables(self) -> set[str]:
+        """Get all existing LightRAG tables in one query"""
+        query = """
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name IN ('LIGHTRAG_DOC_FULL', 'LIGHTRAG_DOC_CHUNKS', 'LIGHTRAG_VDB_ENTITY', 
+                             'LIGHTRAG_VDB_RELATION', 'LIGHTRAG_LLM_CACHE', 'LIGHTRAG_DOC_STATUS')
+        """
+        try:
+            result = await self.query(query, multirows=True)
+            if result:
+                return set(r.get('table_name', '').upper() for r in result)
+            return set()
+        except Exception as e:
+            logger.warning(f"Error fetching existing tables: {e}")
+            return set()
+            
+    async def get_existing_indexes(self) -> set[str]:
+        """Get all existing LightRAG indexes in one query"""
+        query = """
+            SELECT indexname
+            FROM pg_indexes 
+            WHERE indexname LIKE 'idx_%'
+            AND (schemaname = 'public' OR schemaname IS NULL)
+        """
+        try:
+            result = await self.query(query, multirows=True)
+            if result:
+                return set(r.get('indexname', '').lower() for r in result)
+            return set()
+        except Exception as e:
+            logger.warning(f"Error fetching existing indexes: {e}")
+            return set()
+            
     async def check_tables(self):
+        # Skip if tables have already been checked in this instance
+        if self.tables_checked:
+            logger.debug("Tables already checked, skipping")
+            return
+            
+        logger.info("Checking database tables...")
+        start_time = time.time()
+            
         # Ensure pgvector extension is available
         try:
-            await self.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            logger.info("PostgreSQL, Ensured vector extension is available")
+            await self.execute_raw("CREATE EXTENSION IF NOT EXISTS vector")
+            logger.debug("PostgreSQL, Ensured vector extension is available")
         except Exception as e:
             logger.warning(f"PostgreSQL, Unable to create vector extension: {e}")
-            
-        for k, v in TABLES.items():
+        
+        # Get all existing tables and indexes in batch queries
+        existing_tables = await self.get_existing_tables()
+        existing_indexes = await self.get_existing_indexes()
+        
+        logger.debug(f"Found existing tables: {existing_tables}")
+        logger.debug(f"Found existing indexes: {existing_indexes}")
+        
+        # Process missing tables
+        for table_name in TABLES.keys():
             try:
-                await self.query(f"SELECT 1 FROM {k} LIMIT 1")
-                # Table exists, ensure indexes are present
-                await self._ensure_indexes(k)
-            except Exception:
-                try:
-                    logger.info(f"PostgreSQL, Try Creating table {k} in database")
-                    await self.execute(v["ddl"])
-                    logger.info(
-                        f"PostgreSQL, Creation success table {k} in PostgreSQL database"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"PostgreSQL, Failed to create table {k} in database, Please verify the connection with PostgreSQL database, Got: {e}"
-                    )
-                    raise e
+                if table_name in existing_tables:
+                    # Table exists, only ensure indexes that don't exist
+                    needed_indexes = self._get_missing_indexes(table_name, existing_indexes)
+                    if needed_indexes:
+                        await self._create_indexes(table_name, needed_indexes)
+                else:
+                    # Table needs to be created
+                    logger.info(f"Creating table {table_name}")
                     
+                    # Split DDL into individual statements
+                    ddl_statements = self._split_ddl(TABLES[table_name]["ddl"])
+                    
+                    # Execute each statement separately
+                    for stmt in ddl_statements:
+                        if stmt.strip():
+                            await self.execute_raw(stmt)
+                            
+                    logger.info(f"Successfully created table {table_name}")
+            except Exception as e:
+                logger.error(f"Error with table {table_name}: {e}")
+                
+        # Mark tables as checked
+        self.tables_checked = True
+        logger.info(f"Database tables check completed in {time.time() - start_time:.2f}s")
+        
+    def _split_ddl(self, ddl: str) -> list[str]:
+        """Split DDL with multiple statements into individual commands"""
+        # First, find the main CREATE TABLE statement
+        table_stmt_end = ddl.find(';', ddl.find('CREATE TABLE'))
+        if table_stmt_end == -1:
+            # No semicolon found, assume entire string is one statement
+            return [ddl]
+            
+        # Extract the create table part
+        create_table_stmt = ddl[:table_stmt_end+1]
+        remaining = ddl[table_stmt_end+1:]
+        
+        # Split remaining statements by semicolons with comments handling
+        statements = []
+        statements.append(create_table_stmt)
+        
+        # Simple statement splitter that respects comments
+        current_stmt = ""
+        in_comment = False
+        for line in remaining.split("\n"):
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+                
+            # Handle comment lines
+            if line.startswith("--"):
+                continue
+                
+            # Add this line to current statement
+            current_stmt += line + " "
+            
+            # If line ends with semicolon, it's a complete statement
+            if line.endswith(";"):
+                statements.append(current_stmt.strip())
+                current_stmt = ""
+                
+        # Add any final statement without semicolon
+        if current_stmt.strip():
+            statements.append(current_stmt.strip())
+            
+        return statements
+                    
+    # Define all indexes in one place as a class variable for easy access
+    TABLE_INDEXES = {
+        "LIGHTRAG_DOC_CHUNKS": [
+            {
+                "name": "idx_doc_chunks_full_doc_id",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_doc_chunks_full_doc_id ON LIGHTRAG_DOC_CHUNKS(workspace, full_doc_id)",
+                "is_vector": False
+            },
+            {
+                "name": "idx_chunks_vector",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_chunks_vector ON LIGHTRAG_DOC_CHUNKS USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)",
+                "is_vector": True
+            }
+        ],
+        "LIGHTRAG_VDB_ENTITY": [
+            {
+                "name": "idx_entity_entity_name",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_entity_entity_name ON LIGHTRAG_VDB_ENTITY(workspace, entity_name)",
+                "is_vector": False
+            },
+            {
+                "name": "idx_entity_vector",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_entity_vector ON LIGHTRAG_VDB_ENTITY USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)",
+                "is_vector": True
+            }
+        ],
+        "LIGHTRAG_VDB_RELATION": [
+            {
+                "name": "idx_relation_source_id",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_relation_source_id ON LIGHTRAG_VDB_RELATION(workspace, source_id)",
+                "is_vector": False
+            },
+            {
+                "name": "idx_relation_target_id",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_relation_target_id ON LIGHTRAG_VDB_RELATION(workspace, target_id)",
+                "is_vector": False
+            },
+            {
+                "name": "idx_relation_vector",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_relation_vector ON LIGHTRAG_VDB_RELATION USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)",
+                "is_vector": True
+            }
+        ],
+        "LIGHTRAG_LLM_CACHE": [
+            {
+                "name": "idx_llm_cache_mode",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_llm_cache_mode ON LIGHTRAG_LLM_CACHE(workspace, mode)",
+                "is_vector": False
+            }
+        ],
+        "LIGHTRAG_DOC_STATUS": [
+            {
+                "name": "idx_doc_status_status",
+                "sql": "CREATE INDEX IF NOT EXISTS idx_doc_status_status ON LIGHTRAG_DOC_STATUS(workspace, status)",
+                "is_vector": False
+            }
+        ]
+    }
+    
+    def _get_missing_indexes(self, table_name: str, existing_indexes: set[str]) -> list[dict]:
+        """Determine which indexes need to be created for a table"""
+        if table_name not in self.TABLE_INDEXES:
+            return []
+            
+        # Find indexes for this table that don't exist yet
+        missing_indexes = []
+        for index_info in self.TABLE_INDEXES[table_name]:
+            if index_info["name"].lower() not in existing_indexes:
+                missing_indexes.append(index_info)
+                
+        return missing_indexes
+    
+    async def _create_indexes(self, table_name: str, indexes: list[dict]) -> None:
+        """Create multiple indexes for a table"""
+        if not indexes:
+            return
+            
+        logger.debug(f"Creating {len(indexes)} missing indexes for {table_name}")
+        
+        for index_info in indexes:
+            try:
+                await self.execute_raw(index_info["sql"])
+                logger.debug(f"Created index {index_info['name']}")
+            except Exception as e:
+                # Vector indexes might fail if pgvector isn't set up properly
+                if index_info["is_vector"]:
+                    logger.warning(f"Could not create vector index {index_info['name']}: {e}")
+                else:
+                    logger.warning(f"Failed to create index {index_info['name']}: {e}")
+    
+    # Legacy method for backward compatibility
     async def _ensure_indexes(self, table_name: str):
         """Ensures required indexes exist on existing tables"""
         try:
-            if table_name == "LIGHTRAG_DOC_CHUNKS":
-                # Add full_doc_id index
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_doc_chunks_full_doc_id ON LIGHTRAG_DOC_CHUNKS(workspace, full_doc_id)"
-                )
-                # Add vector index
-                try:
-                    await self.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_chunks_vector ON LIGHTRAG_DOC_CHUNKS USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not create vector index on {table_name}: {e}")
+            # Get existing indexes in one query
+            existing_indexes = await self.get_existing_indexes()
+            
+            # Find which indexes need to be created
+            needed_indexes = self._get_missing_indexes(table_name, existing_indexes)
+            
+            # Create any missing indexes
+            if needed_indexes:
+                await self._create_indexes(table_name, needed_indexes)
                 
-            elif table_name == "LIGHTRAG_VDB_ENTITY":
-                # Add entity name index
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_entity_entity_name ON LIGHTRAG_VDB_ENTITY(workspace, entity_name)"
-                )
-                # Add vector index
-                try:
-                    await self.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_entity_vector ON LIGHTRAG_VDB_ENTITY USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not create vector index on {table_name}: {e}")
-                
-            elif table_name == "LIGHTRAG_VDB_RELATION":
-                # Add source and target indexes
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_relation_source_id ON LIGHTRAG_VDB_RELATION(workspace, source_id)"
-                )
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_relation_target_id ON LIGHTRAG_VDB_RELATION(workspace, target_id)"
-                )
-                # Add vector index
-                try:
-                    await self.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_relation_vector ON LIGHTRAG_VDB_RELATION USING ivfflat (content_vector vector_cosine_ops) WITH (lists = 100)"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not create vector index on {table_name}: {e}")
-                
-            elif table_name == "LIGHTRAG_LLM_CACHE":
-                # Add mode index
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_llm_cache_mode ON LIGHTRAG_LLM_CACHE(workspace, mode)"
-                )
-                
-            elif table_name == "LIGHTRAG_DOC_STATUS":
-                # Add status index
-                await self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_doc_status_status ON LIGHTRAG_DOC_STATUS(workspace, status)"
-                )
-                
-            logger.info(f"PostgreSQL, Ensured indexes for {table_name}")
         except Exception as e:
-            logger.warning(f"Failed to create indexes for {table_name}: {e}")
+            logger.warning(f"Failed to ensure indexes for {table_name}: {e}")
             # Non-fatal - indexes improve performance but aren't essential for functionality
 
-            # Create index for id column in each table
-            try:
-                index_name = f"idx_{k.lower()}_id"
-                check_index_sql = f"""
-                SELECT 1 FROM pg_indexes
-                WHERE indexname = '{index_name}'
-                AND tablename = '{k.lower()}'
-                """
-                index_exists = await self.query(check_index_sql)
-
-                if not index_exists:
-                    create_index_sql = f"CREATE INDEX {index_name} ON {k}(id)"
-                    logger.info(f"PostgreSQL, Creating index {index_name} on table {k}")
-                    await self.execute(create_index_sql)
-            except Exception as e:
-                logger.error(
-                    f"PostgreSQL, Failed to create index on table {k}, Got: {e}"
-                )
-
+    # Statement cache to avoid repeated preparation
+    _stmt_cache = {}
+    _stmt_cache_limit = 300
+    
+    async def _get_prepared_stmt(self, connection, sql):
+        """Get or create a prepared statement with caching"""
+        # Use hash of SQL as cache key
+        cache_key = hash(sql)
+        
+        if cache_key in self._stmt_cache:
+            # Return cached statement if connection matches
+            cached_stmt, cached_conn = self._stmt_cache[cache_key]
+            if cached_conn is connection:
+                return cached_stmt
+        
+        # Prepare new statement
+        stmt = await connection.prepare(sql)
+        
+        # Manage cache size
+        if len(self._stmt_cache) >= self._stmt_cache_limit:
+            # Remove a random entry to avoid cache growing too large
+            self._stmt_cache.pop(next(iter(self._stmt_cache)))
+            
+        # Cache the statement with its connection
+        self._stmt_cache[cache_key] = (stmt, connection)
+        return stmt
+    
     async def query(
         self,
         sql: str,
@@ -214,6 +438,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
+        if self.pool is None or self.pool._closed:
+            await self.initdb()  # Auto-reconnect if needed
+        
         async with self.pool.acquire() as connection:  # type: ignore
             if with_age and graph_name:
                 await self.configure_age(connection, graph_name)  # type: ignore
@@ -221,8 +448,10 @@ class PostgreSQLDB:
                 raise ValueError("Graph name is required when with_age is True")
 
             try:
-                stmt = await connection.prepare(sql)
+                # Use cached or prepare new statement
+                stmt = await self._get_prepared_stmt(connection, sql)
                 
+                # Execute query
                 if params:
                     param_values = []
                     for _, val in params.items():
@@ -235,21 +464,20 @@ class PostgreSQLDB:
                 else:
                     rows = await stmt.fetch()
 
+                # Process results
+                if not rows:
+                    return [] if multirows else None
+                    
                 if multirows:
-                    if rows:
-                        columns = [col for col in rows[0].keys()]
-                        data = [dict(zip(columns, row)) for row in rows]
-                    else:
-                        data = []
+                    columns = [col for col in rows[0].keys()]
+                    data = [dict(zip(columns, row)) for row in rows]
                 else:
-                    if rows:
-                        columns = rows[0].keys()
-                        data = dict(zip(columns, rows[0]))
-                    else:
-                        data = None
+                    columns = rows[0].keys()
+                    data = dict(zip(columns, rows[0]))
+                    
                 return data
             except Exception as e:
-                logger.error(f"PostgreSQL database, error:{e}")
+                logger.error(f"PostgreSQL database query error: {e}, SQL: {sql[:100]}...")
                 raise
 
     async def execute(
@@ -260,6 +488,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
     ):
+        if self.pool is None or self.pool._closed:
+            await self.initdb()  # Auto-reconnect if needed
+        
         try:
             async with self.pool.acquire() as connection:  # type: ignore
                 if with_age and graph_name:
@@ -267,8 +498,10 @@ class PostgreSQLDB:
                 elif with_age and not graph_name:
                     raise ValueError("Graph name is required when with_age is True")
 
-                stmt = await connection.prepare(sql)
+                # Use cached or prepare new statement
+                stmt = await self._get_prepared_stmt(connection, sql)
                 
+                # Execute statement
                 if data is None:
                     await stmt.fetch()
                 else:
@@ -285,27 +518,41 @@ class PostgreSQLDB:
             asyncpg.exceptions.DuplicateTableError,
         ) as e:
             if upsert:
-                logger.info("Key value duplicate, but upsert succeeded.")
+                logger.debug("Key value duplicate, but upsert succeeded.")
             else:
                 logger.error(f"Upsert error: {e}")
         except asyncpg.exceptions.QueryCanceledError as e:
             logger.error(f"Query timed out: {sql[:100]}...")
             raise asyncpg.exceptions.QueryCanceledError(f"Query execution timeout: {e}") from e
         except Exception as e:
-            logger.error(f"PostgreSQL database,\nsql:{sql},\ndata:{data},\nerror:{str(e)}")
+            logger.error(f"PostgreSQL database execute error: {e}, SQL: {sql[:100]}...")
             raise
 
 
 class ClientManager:
     _instances: dict[str, Any] = {"db": None, "ref_count": 0}
     _lock = asyncio.Lock()
+    _client_init_task = None
+    _config = None
+    _lazy_init_done = False
+    _pool_timeout = 60.0  # Keep connections alive longer (seconds)
+    _connection_timeout = 5.0  # seconds
+    _keepalive_task = None
 
     @staticmethod
     def get_config() -> dict[str, Any]:
+        # Cache config to avoid repeated file reads
+        if ClientManager._config is not None:
+            return ClientManager._config
+            
         config = configparser.ConfigParser()
-        config.read("config.ini", "utf-8")
-
-        return {
+        try:
+            config.read("config.ini", "utf-8")
+        except Exception as e:
+            logger.warning(f"Could not read config.ini: {e}, using environment variables only")
+            
+        # Core database connection settings
+        ClientManager._config = {
             "host": os.environ.get(
                 "POSTGRES_HOST",
                 config.get("postgres", "host", fallback="localhost"),
@@ -328,33 +575,142 @@ class ClientManager:
                 "POSTGRES_WORKSPACE",
                 config.get("postgres", "workspace", fallback="default"),
             ),
+            # Schema validation control
+            "skip_schema_validation": os.environ.get("LIGHTRAG_SKIP_SCHEMA", "").lower() in ("1", "true", "yes")
+                or config.get("postgres", "skip_schema_validation", fallback="").lower() in ("1", "true", "yes"),
+            # Performance settings
+            "connection_timeout": float(os.environ.get("POSTGRES_CONN_TIMEOUT", 
+                                     config.get("postgres", "connection_timeout", fallback="10.0"))),
+            "statement_cache_size": int(os.environ.get("POSTGRES_STMT_CACHE_SIZE",
+                                      config.get("postgres", "statement_cache_size", fallback="200"))),
         }
+        return ClientManager._config
 
     @classmethod
+    async def _keep_connection_alive(cls):
+        """Background task to keep connection pool alive"""
+        try:
+            while True:
+                # Use shorter sleep interval so the task can be cancelled promptly
+                for _ in range(6):  # 6 x 5s = 30s total
+                    await asyncio.sleep(5)
+                    # Check if we're shutting down during sleep
+                    if cls._instances["db"] is None:
+                        logger.debug("Shutting down, stopping keepalive")
+                        return
+                
+                async with cls._lock:
+                    if cls._instances["db"] is None:
+                        # Database connection gone, stop the keepalive task
+                        logger.debug("Database connection gone, stopping keepalive")
+                        return
+                        
+                    if hasattr(cls._instances["db"], "pool") and not cls._instances["db"].pool._closed:
+                        # Send a simple query to keep the connection alive
+                        try:
+                            await cls._instances["db"].execute("SELECT 1")
+                            logger.debug("Connection keepalive ping successful")
+                        except Exception as e:
+                            logger.warning(f"Keepalive ping failed: {e}")
+        except asyncio.CancelledError:
+            logger.debug("Keepalive task cancelled")
+            # Clean self-reference to help with garbage collection
+            cls._keepalive_task = None
+        except Exception as e:
+            logger.error(f"Error in keepalive task: {e}")
+            # Clean self-reference
+            cls._keepalive_task = None
+
+    @classmethod
+    async def _lazy_init(cls):
+        """Initialize database client lazily"""
+        if cls._lazy_init_done:
+            return
+            
+        config = ClientManager.get_config()
+        db = PostgreSQLDB(config)
+        
+        logger.info("Lazy initializing database client and pool")
+        await db.initdb()
+        await db.check_tables()
+        
+        cls._instances["db"] = db
+        cls._instances["ref_count"] = 1
+        cls._lazy_init_done = True
+        
+        # Start the keepalive task if it's not running
+        if cls._keepalive_task is None or cls._keepalive_task.done():
+            cls._keepalive_task = asyncio.create_task(cls._keep_connection_alive())
+        
+        return db
+
+    @classmethod
+    @performance
     async def get_client(cls) -> PostgreSQLDB:
-        async with cls._lock:
-            if cls._instances["db"] is None:
-                config = ClientManager.get_config()
-                db = PostgreSQLDB(config)
-                await db.initdb()
-                await db.check_tables()
-                cls._instances["db"] = db
-                cls._instances["ref_count"] = 0
-            cls._instances["ref_count"] += 1
-            return cls._instances["db"]
+        """Get a client from the shared pool with optimized connection handling"""
+        # Configure timeout and retries
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                async with cls._lock:
+                    # Check if we already have a valid instance - fast path
+                    if cls._instances["db"] is not None and hasattr(cls._instances["db"], "pool") and not cls._instances["db"].pool._closed:
+                        cls._instances["ref_count"] += 1
+                        return cls._instances["db"]
+                    
+                    # Initialize if not already done
+                    if not cls._lazy_init_done:
+                        db = await cls._lazy_init()
+                        return db
+                    
+                    # Re-initialize if needed (pool was closed)
+                    logger.info("Reconnecting database client")
+                    config = ClientManager.get_config()
+                    db = PostgreSQLDB(config)
+                    await db.initdb()
+                    # Skip table check for reconnection since it's expensive
+                    cls._instances["db"] = db
+                    cls._instances["ref_count"] = 1
+                    return db
+                    
+            except Exception as e:
+                logger.error(f"Error getting client (attempt {retry_count+1}/{max_retries}): {e}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    raise
+                await asyncio.sleep(0.5 * retry_count)  # Exponential backoff
+        
+        raise RuntimeError("Failed to get database client after multiple retries")
 
     @classmethod
     async def release_client(cls, db: PostgreSQLDB):
+        """Manage reference count but keep connection pool alive"""
         async with cls._lock:
-            if db is not None:
-                if db is cls._instances["db"]:
-                    cls._instances["ref_count"] -= 1
-                    if cls._instances["ref_count"] == 0:
-                        await db.pool.close()
-                        logger.info("Closed PostgreSQL database connection pool")
+            if db is not None and db is cls._instances["db"]:
+                cls._instances["ref_count"] -= 1
+                logger.debug(f"Released client, ref count: {cls._instances['ref_count']}")
+                
+                # Keep pool alive longer, only close if program is shutting down or ref count has been 0 for a while
+                if cls._instances["ref_count"] <= 0:
+                    cls._instances["ref_count"] = 0  # Ensure we don't go negative
+                    
+                    # Program exiting - check if we should cleanup fully
+                    if os.environ.get("LIGHTRAG_CLEANUP_ON_EXIT", "").lower() in ("1", "true", "yes"):
+                        logger.info("Cleaning up database connections on exit")
+                        
+                        # Cancel keepalive task if running
+                        if cls._keepalive_task and not cls._keepalive_task.done():
+                            cls._keepalive_task.cancel()
+                            
+                        # Close pool
+                        if db.pool and not db.pool._closed:
+                            await db.pool.close()
+                            logger.info("Closed PostgreSQL connection pool")
+                            
+                        # Clean instance reference
                         cls._instances["db"] = None
-                else:
-                    await db.pool.close()
 
 
 @final
@@ -734,6 +1090,9 @@ class PGVectorStorage(BaseVectorStorage):
                 for result in results:
                     if "entity_name" not in result and "e.entity_name" in result:
                         result["entity_name"] = result["e.entity_name"]
+                    # Ensure source_id is present
+                    if "source_id" not in result:
+                        result["source_id"] = result.get("chunk_ids", ["unknown"])[0] if isinstance(result.get("chunk_ids", []), list) else "unknown"
             
             elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
                 for result in results:
@@ -741,6 +1100,9 @@ class PGVectorStorage(BaseVectorStorage):
                         result["src_id"] = result["r.source_id"]
                     if "tgt_id" not in result and "r.target_id" in result:
                         result["tgt_id"] = result["r.target_id"]
+                    # Ensure source_id is present
+                    if "source_id" not in result:
+                        result["source_id"] = result.get("chunk_ids", ["unknown"])[0] if isinstance(result.get("chunk_ids", []), list) else "unknown"
             
             return results
         except Exception as e:
@@ -1151,12 +1513,27 @@ class PGGraphQueryException(Exception):
 @final
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
-    def __post_init__(self):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Use LRU caches for frequent operations
+        self._node_cache = {}
+        self._edge_cache = {}
+        self._node_edges_cache = {}
+        self._max_cache_size = 1000  # Configurable
+        self._cache_hits = 0
+        self._cache_misses = 0
         self.graph_name = self.namespace or os.environ.get("AGE_GRAPH_NAME", "lightrag")
         self._node_embed_algorithms = {
             "node2vec": self._node2vec_embed,
         }
         self.db: PostgreSQLDB | None = None
+
+    # def __post_init__(self):
+    #     self.graph_name = self.namespace or os.environ.get("AGE_GRAPH_NAME", "lightrag")
+    #     self._node_embed_algorithms = {
+    #         "node2vec": self._node2vec_embed,
+    #     }
+    #     self.db: PostgreSQLDB | None = None
 
     async def initialize(self):
         if self.db is None:
@@ -1279,18 +1656,14 @@ class PGGraphStorage(BaseGraphStorage):
         """
         Query the graph by taking a cypher query, converting it to an
         age compatible query, executing it and converting the result
-
-        Args:
-            query (str): a cypher query to be executed
-            readonly (bool): whether the query is readonly or not
-            upsert (bool): whether to handle unique violations as upserts
-
-        Returns:
-            list[dict[str, Any]]: a list of dictionaries containing the result set
-        
-        Raises:
-            PGGraphQueryException: If the query fails
         """
+        # Check if db exists
+        if self.db is None:
+            logger.error("Database connection is None")
+            await self.initialize()
+            if self.db is None:
+                raise PGGraphQueryException({"message": "Database connection is None", "detail": "Failed to initialize database"})
+        
         try:
             if readonly:
                 data = await self.db.query(
@@ -1311,16 +1684,7 @@ class PGGraphStorage(BaseGraphStorage):
                 return []
             else:
                 return [self._record_to_dict(d) for d in data]
-                
-        except asyncpg.exceptions.QueryCanceledError as e:
-            query_summary = query[:100] + "..." if len(query) > 100 else query
-            logger.error(f"Query execution timed out: {query_summary}")
-            raise PGGraphQueryException({"message": "Query execution timed out", "detail": str(e)})
-            
-        except asyncpg.exceptions.PostgresError as e:
-            logger.error(f"Database error: {str(e)}")
-            raise PGGraphQueryException({"message": f"Database error: {str(e)}", "detail": str(e)}) from e
-            
+                    
         except Exception as e:
             logger.error(f"Error in graph query: {str(e)}")
             raise PGGraphQueryException({
@@ -1359,21 +1723,241 @@ class PGGraphStorage(BaseGraphStorage):
 
         return single_result["edge_exists"]
 
+    @performance
+    async def get_nodes_batch(self, node_ids: list[str]) -> dict[str, dict]:
+        """Get multiple nodes in a single query"""
+        if not node_ids:
+            return {}
+        
+        # Track performance
+        start_time = time.time()
+        
+        # Verify database connection
+        if self.db is None or getattr(self.db, 'pool', None) is None or self.db.pool._closed:
+            logger.error("Database connection is not available or closed")
+            await self.initialize()  # Try to reinitialize
+            if self.db is None or getattr(self.db, 'pool', None) is None or self.db.pool._closed:
+                logger.error("Failed to reinitialize database connection")
+                return {}
+        
+        # Create batch query
+        encoded_ids = [self._encode_graph_label(node_id.strip('"')) for node_id in node_ids]
+        id_list = ", ".join([f'"{node_id}"' for node_id in encoded_ids])
+        
+        query = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                    MATCH (n:Entity)
+                    WHERE n.node_id IN [{id_list}]
+                    RETURN n.node_id AS node_id, n AS node
+                $$) AS (node_id text, node agtype)"""
+        
+        try:
+            results = await self._query(query)
+            
+            # Build a map of original ids to node data
+            nodes_map = {}
+            for record in results:
+                if "node_id" in record and "node" in record:
+                    original_id = self._decode_graph_label(record["node_id"])
+                    nodes_map[original_id] = record["node"]
+            
+            # Log performance for large batches
+            if len(node_ids) > 10:
+                logger.debug(
+                    f"Batch retrieved {len(nodes_map)}/{len(node_ids)} nodes in {time.time() - start_time:.4f}s"
+                )
+                
+            return nodes_map
+        except Exception as e:
+            logger.error(f"Error in batch node retrieval: {e}")
+            return {}
+    
+    @performance
+    async def get_edges_batch(self, edge_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        """Get multiple edges in a single query"""
+        if not edge_pairs:
+            return {}
+        
+        # Track performance
+        start_time = time.time()
+        
+        # Build query for multiple edges
+        edge_conditions = []
+        for src, tgt in edge_pairs:
+            src_encoded = self._encode_graph_label(src.strip('"'))
+            tgt_encoded = self._encode_graph_label(tgt.strip('"'))
+            edge_conditions.append(f'(a.node_id = "{src_encoded}" AND b.node_id = "{tgt_encoded}")')
+        
+        conditions = " OR ".join(edge_conditions)
+        
+        query = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                    MATCH (a:Entity)-[r]->(b:Entity)
+                    WHERE {conditions}
+                    RETURN a.node_id AS src_id, b.node_id AS tgt_id, properties(r) AS edge_data
+                $$) AS (src_id text, tgt_id text, edge_data agtype)"""
+        
+        try:
+            results = await self._query(query)
+            
+            # Build a map of edge pairs to edge data
+            edges_map = {}
+            for record in results:
+                if "src_id" in record and "tgt_id" in record and "edge_data" in record:
+                    src_id = self._decode_graph_label(record["src_id"])
+                    tgt_id = self._decode_graph_label(record["tgt_id"])
+                    edges_map[(src_id, tgt_id)] = record["edge_data"]
+            
+            # Log performance for large batches
+            if len(edge_pairs) > 10:
+                logger.debug(
+                    f"Batch retrieved {len(edges_map)}/{len(edge_pairs)} edges in {time.time() - start_time:.4f}s"
+                )
+                
+            return edges_map
+        except Exception as e:
+            logger.error(f"Error in batch edge retrieval: {e}")
+            return {}
+
+    @performance
+    async def get_node_edges_batch(self, node_ids: list[str]) -> dict[str, list[tuple[str, str]]]:
+        """Get edges for multiple nodes in a single query"""
+        if not node_ids:
+            return {}
+        
+        # Track performance
+        start_time = time.time()
+        
+        # Build query for multiple nodes' edges
+        encoded_ids = [self._encode_graph_label(node_id.strip('"')) for node_id in node_ids]
+        id_list = ", ".join([f'"{node_id}"' for node_id in encoded_ids])
+        
+        query = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                    MATCH (n:Entity)-[r]-(m:Entity)
+                    WHERE n.node_id IN [{id_list}]
+                    RETURN n.node_id AS node_id, collect([m.node_id, type(r)]) AS connections
+                $$) AS (node_id text, connections agtype)"""
+        
+        try:
+            results = await self._query(query)
+            
+            # Build a map of node ids to edge lists
+            edges_map = {node_id: [] for node_id in node_ids}
+            for record in results:
+                if "node_id" in record and "connections" in record:
+                    src_id = self._decode_graph_label(record["node_id"])
+                    connections = record["connections"]
+                    edges = []
+                    for conn in connections:
+                        if len(conn) >= 2:
+                            tgt_id = self._decode_graph_label(conn[0])
+                            edges.append((src_id, tgt_id))
+                    edges_map[src_id] = edges
+            
+            # Log performance for large batches
+            if len(node_ids) > 10:
+                edges_count = sum(len(edges) for edges in edges_map.values())
+                logger.debug(
+                    f"Batch retrieved {edges_count} edges for {len(edges_map)} nodes in {time.time() - start_time:.4f}s"
+                )
+                
+            return edges_map
+        except Exception as e:
+            logger.error(f"Error in batch node edges retrieval: {e}")
+            return {node_id: [] for node_id in node_ids}
+    
+    async def get_edge_degrees_batch(self, edge_pairs: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
+        """Get degrees for multiple edges in a single query.
+        
+        This calculates the combined degree (number of connections) for the source and target 
+        nodes of each edge. Higher degrees indicate more connected/central nodes in the graph.
+        
+        Args:
+            edge_pairs: List of tuples containing (source_node_id, target_node_id)
+            
+        Returns:
+            Dictionary mapping edge pairs to their combined degree
+        """
+        if not edge_pairs:
+            return {}
+        
+        # Track performance
+        start_time = time.time()
+        
+        # Build query components for all edges
+        node_pairs_map = {}
+        for src, tgt in edge_pairs:
+            src_encoded = self._encode_graph_label(src.strip('"'))
+            tgt_encoded = self._encode_graph_label(tgt.strip('"'))
+            node_pairs_map[(src, tgt)] = (src_encoded, tgt_encoded)
+        
+        # Get all unique nodes to query
+        all_nodes = set()
+        for src, tgt in edge_pairs:
+            all_nodes.add(src)
+            all_nodes.add(tgt)
+        
+        node_ids = list(all_nodes)
+        encoded_nodes = [self._encode_graph_label(node_id.strip('"')) for node_id in node_ids]
+        node_list = ", ".join([f'"{node_id}"' for node_id in encoded_nodes])
+        
+        # Query for degrees of all nodes in a single operation
+        query = f"""SELECT * FROM cypher('{self.graph_name}', $$
+                    MATCH (n:Entity)
+                    WHERE n.node_id IN [{node_list}]
+                    OPTIONAL MATCH (n)-[r]->()
+                    RETURN n.node_id AS node_id, count(r) AS degree
+                $$) AS (node_id text, degree integer)"""
+        
+        try:
+            results = await self._query(query)
+            
+            # Build degree map for each node
+            node_degree_map = {}
+            for result in results:
+                if "node_id" in result and "degree" in result:
+                    original_id = self._decode_graph_label(result["node_id"])
+                    node_degree_map[original_id] = result["degree"]
+            
+            # Calculate combined degrees for each edge pair
+            edge_degrees = {}
+            for edge in edge_pairs:
+                src, tgt = edge
+                src_degree = node_degree_map.get(src, 0)
+                tgt_degree = node_degree_map.get(tgt, 0)
+                edge_degrees[edge] = src_degree + tgt_degree
+            
+            # Log performance for large batches
+            if len(edge_pairs) > 10:
+                logger.debug(
+                    f"Batch retrieved degrees for {len(edge_degrees)} edges in {time.time() - start_time:.4f}s"
+                )
+            
+            return edge_degrees
+            
+        except Exception as e:
+            logger.error(f"Error in batch edge degree retrieval: {e}")
+            return {edge: 0 for edge in edge_pairs}
+    
+    @performance
     async def get_node(self, node_id: str) -> dict[str, str] | None:
-        """Get node by its label identifier, return only node properties"""
-
-        label = node_id.strip('"')
-        query = """SELECT * FROM cypher('%s', $$
-                     MATCH (n:base {entity_id: "%s"})
-                     RETURN n
-                   $$) AS (n agtype)""" % (self.graph_name, label)
-        record = await self._query(query)
-        if record:
-            node = record[0]
-            node_dict = node["n"]["properties"]
-
-            return node_dict
-        return None
+        """Get node with caching"""
+        cache_key = node_id
+        if cache_key in self._node_cache:
+            self._cache_hits += 1
+            return self._node_cache[cache_key]
+            
+        self._cache_misses += 1
+        result = await self._get_node_impl(node_id)
+        
+        # Manage cache size
+        if len(self._node_cache) >= self._max_cache_size:
+            # Remove oldest 10% of entries
+            remove_count = max(1, self._max_cache_size // 10)
+            for _ in range(remove_count):
+                if self._node_cache:
+                    self._node_cache.pop(next(iter(self._node_cache)), None)
+                
+        self._node_cache[cache_key] = result
+        return result
 
     async def node_degree(self, node_id: str) -> int:
         label = node_id.strip('"')
@@ -1399,6 +1983,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         return degrees
 
+    @performance
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
@@ -1422,11 +2007,13 @@ class PGGraphStorage(BaseGraphStorage):
 
             return result
 
+    @performance
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]]:
       """
       Retrieves all edges (relationships) for a particular node identified by its label.
       :return: list of tuples containing (source, target) node IDs
       """
+      print(Fore.BLUE + f"get_node_edges: {source_node_id}")
       try:
           label = self._encode_graph_label(source_node_id.strip('"'))
           
@@ -1977,41 +2564,56 @@ SQL_TEMPLATES = {
                                       WHERE workspace=$1::varchar(255) AND id = ANY($2::varchar(255)[])
                                     """,
     "vector_query_chunks": """
-            SELECT c.id
-            FROM LIGHTRAG_DOC_CHUNKS c
-            WHERE c.workspace=$1::varchar(255)
-            AND (c.full_doc_id = ANY($3::varchar(255)[]) OR $3::varchar(255)[] IS NULL)
-            ORDER BY c.content_vector <=> $4::vector
-            LIMIT $2::int
+            WITH vector_search AS (
+                SELECT c.id, c.content, c.full_doc_id, c.file_path, c.content_vector <=> $4::vector AS distance
+                FROM LIGHTRAG_DOC_CHUNKS c
+                WHERE c.workspace=$1::varchar(255)
+                AND ($3::varchar(255)[] IS NULL OR c.full_doc_id = ANY($3::varchar(255)[]))
+                ORDER BY distance
+                LIMIT $2::int
+            )
+            SELECT id, content, full_doc_id, file_path, distance
+            FROM vector_search
             """,
     "vector_query_entities": """
-            SELECT e.entity_name
-            FROM LIGHTRAG_VDB_ENTITY e
-            WHERE e.workspace=$1::varchar(255)
-            AND ($3::varchar(255)[] IS NULL OR 
+            WITH vector_search AS (
+                SELECT e.id, e.entity_name, e.content, e.chunk_ids, e.file_path,
+                    e.content_vector <=> $4::vector AS distance
+                FROM LIGHTRAG_VDB_ENTITY e
+                WHERE e.workspace=$1::varchar(255)
+                ORDER BY distance
+                LIMIT $2::int * 2  -- Fetch more candidates for filtering
+            )
+            SELECT vs.id, vs.entity_name, vs.content, vs.file_path, vs.distance
+            FROM vector_search vs
+            WHERE $3::varchar(255)[] IS NULL OR
                 EXISTS (
                     SELECT 1 FROM LIGHTRAG_DOC_CHUNKS c
-                    WHERE c.id = ANY(e.chunk_ids::varchar(255)[])
-                    AND c.workspace=$1::varchar(255)
-                    AND (c.full_doc_id = ANY($3::varchar(255)[]) OR $3::varchar(255)[] IS NULL)
+                    WHERE c.workspace=$1::varchar(255)
+                    AND c.id = ANY(vs.chunk_ids)
+                    AND c.full_doc_id = ANY($3::varchar(255)[])
                 )
-            )
-            ORDER BY e.content_vector <=> $4::vector
             LIMIT $2::int
             """,
     "vector_query_relationships": """
-            SELECT r.source_id as src_id, r.target_id as tgt_id
-            FROM LIGHTRAG_VDB_RELATION r
-            WHERE r.workspace=$1::varchar(255)
-            AND ($3::varchar(255)[] IS NULL OR 
+            WITH vector_search AS (
+                SELECT r.id, r.source_id as src_id, r.target_id as tgt_id, 
+                    r.content, r.chunk_ids, r.file_path,
+                    r.content_vector <=> $4::vector AS distance
+                FROM LIGHTRAG_VDB_RELATION r
+                WHERE r.workspace=$1::varchar(255)
+                ORDER BY distance
+                LIMIT $2::int * 2  -- Fetch more candidates for filtering
+            )
+            SELECT vs.id, vs.src_id, vs.tgt_id, vs.content, vs.file_path, vs.distance
+            FROM vector_search vs
+            WHERE $3::varchar(255)[] IS NULL OR
                 EXISTS (
                     SELECT 1 FROM LIGHTRAG_DOC_CHUNKS c
-                    WHERE c.id = ANY(r.chunk_ids::varchar(255)[])
-                    AND c.workspace=$1::varchar(255)
-                    AND (c.full_doc_id = ANY($3::varchar(255)[]) OR $3::varchar(255)[] IS NULL)
+                    WHERE c.workspace=$1::varchar(255)
+                    AND c.id = ANY(vs.chunk_ids)
+                    AND c.full_doc_id = ANY($3::varchar(255)[])
                 )
-            )
-            ORDER BY r.content_vector <=> $4::vector
             LIMIT $2::int
             """,
     "upsert_doc_full": """INSERT INTO LIGHTRAG_DOC_FULL (id, content, workspace)

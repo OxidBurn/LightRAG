@@ -184,17 +184,33 @@ async def _handle_single_relationship_extraction(
 ):
     if len(record_attributes) < 5 or record_attributes[0] != '"relationship"':
         return None
-    # add this record as edge
+    
+    # Clean and validate source entity name
     source = clean_str(record_attributes[1]).strip('"')
+    if not source.strip():
+        logger.warning(f"Relationship extraction error: empty source entity in: {record_attributes}")
+        return None
+        
+    # Clean and validate target entity name
     target = clean_str(record_attributes[2]).strip('"')
+    if not target.strip():
+        logger.warning(f"Relationship extraction error: empty target entity in: {record_attributes}")
+        return None
+    
+    # Clean edge description and keywords
     edge_description = clean_str(record_attributes[3]).strip('"')
     edge_keywords = clean_str(record_attributes[4]).strip('"')
-    edge_source_id = chunk_key
+    
+    # Ensure edge_source_id is valid
+    edge_source_id = chunk_key if chunk_key else "unknown"
+    
+    # Try to extract weight if available
     weight = (
         float(record_attributes[-1].strip('"'))
         if is_float_regex(record_attributes[-1])
         else 1.0
     )
+    
     return dict(
         src_id=source,
         tgt_id=target,
@@ -314,6 +330,14 @@ async def _merge_edges_then_upsert(
                 )
 
     # Process edges_data with None checks
+    # Ensure all edge data has required fields
+    for dp in edges_data:
+        if "weight" not in dp:
+            dp["weight"] = 1.0
+        if "source_id" not in dp:
+            dp["source_id"] = "unknown"
+            logger.warning(f"Missing source_id for edge {src_id} -> {tgt_id}, using 'unknown'")
+    
     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
     description = GRAPH_FIELD_SEP.join(
         sorted(
@@ -333,7 +357,7 @@ async def _merge_edges_then_upsert(
     )
     source_id = GRAPH_FIELD_SEP.join(
         set(
-            [dp["source_id"] for dp in edges_data if dp.get("source_id")]
+            [dp["source_id"] for dp in edges_data]
             + already_source_ids
         )
     )
@@ -1001,9 +1025,12 @@ async def mix_kg_vector_query(
             return context
 
         except Exception as e:
-            logger.error(f"Error in get_kg_context: {str(e)}")
+            logger.error(f"Error in get_kg_context: {e.__class__.__name__} - {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
+    
     async def get_vector_context():
         # Consider conversation history in vector search
         augmented_query = query
@@ -1184,17 +1211,38 @@ async def _build_query_context(
             ),
         )
 
-        (
-            ll_entities_context,
-            ll_relations_context,
-            ll_text_units_context,
-        ) = ll_data
+        # Check if ll_data and hl_data have expected structure (3-tuples)
+        if isinstance(ll_data, tuple) and len(ll_data) == 3:
+            (
+                ll_entities_context,
+                ll_relations_context,
+                ll_text_units_context,
+            ) = ll_data
+        else:
+            logger.warning("Invalid local data structure, using empty defaults")
+            ll_entities_context = ""
+            ll_relations_context = ""
+            ll_text_units_context = ""
 
-        (
-            hl_entities_context,
-            hl_relations_context,
-            hl_text_units_context,
-        ) = hl_data
+        if isinstance(hl_data, tuple) and len(hl_data) == 3:
+            (
+                hl_entities_context,
+                hl_relations_context,
+                hl_text_units_context,
+            ) = hl_data
+        else:
+            logger.warning("Invalid global data structure, using empty defaults")
+            hl_entities_context = ""
+            hl_relations_context = ""
+            hl_text_units_context = ""
+
+        # Ensure we have strings to combine
+        ll_entities_context = ll_entities_context if ll_entities_context else ""
+        ll_relations_context = ll_relations_context if ll_relations_context else ""
+        ll_text_units_context = ll_text_units_context if ll_text_units_context else ""
+        hl_entities_context = hl_entities_context if hl_entities_context else ""
+        hl_relations_context = hl_relations_context if hl_relations_context else ""
+        hl_text_units_context = hl_text_units_context if hl_text_units_context else ""
 
         entities_context, relations_context, text_units_context = combine_contexts(
             [hl_entities_context, ll_entities_context],
@@ -1229,7 +1277,7 @@ async def _get_node_data(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
 ):
-    # get similar entities
+    # Get similar entities
     logger.info(
         f"Query nodes: {query}, top_k: {query_param.top_k}, cosine: {entities_vdb.cosine_better_than_threshold}"
     )
@@ -1238,36 +1286,50 @@ async def _get_node_data(
         query, top_k=query_param.top_k, ids=query_param.ids
     )
 
-    if not len(results):
+    if not results:
         return "", "", ""
-    # get entity information
-    node_datas, node_degrees = await asyncio.gather(
-        asyncio.gather(
-            *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
-        ),
-        asyncio.gather(
-            *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
-        ),
-    )
-
-    if not all([n is not None for n in node_datas]):
-        logger.warning("Some nodes are missing, maybe the storage is damaged")
-
-    node_datas = [
-        {**n, "entity_name": k["entity_name"], "rank": d}
-        for k, n, d in zip(results, node_datas, node_degrees)
-        if n is not None
-    ]  # what is this text_chunks_db doing.  dont remember it in airvx.  check the diagram.
-    # get entitytext chunk
+    
+    # Get all entity names
+    entity_names = [r["entity_name"] for r in results]
+    
+    # Use batch operations to get node data and degrees
+    nodes_map = await knowledge_graph_inst.get_nodes_batch(entity_names)
+    
+    # Get node degrees in batch (if batch method available)
+    if hasattr(knowledge_graph_inst, 'get_node_degrees_batch'):
+        degrees_map = await knowledge_graph_inst.get_node_degrees_batch(entity_names)
+    else:
+        # Fallback to parallel execution of individual calls
+        degrees = await asyncio.gather(
+            *[knowledge_graph_inst.node_degree(name) for name in entity_names]
+        )
+        degrees_map = {name: degree for name, degree in zip(entity_names, degrees)}
+    
+    # Process node data
+    node_datas = []
+    for entity_name, result in zip(entity_names, results):
+        node_data = nodes_map.get(entity_name)
+        if node_data:
+            node_datas.append({
+                **node_data,
+                "entity_name": entity_name,
+                "rank": degrees_map.get(entity_name, 0)
+            })
+    
+    # Get all node edges in batch
+    edges_map = await knowledge_graph_inst.get_node_edges_batch(entity_names)
+    
+    # Process text units and relations in parallel
     use_text_units, use_relations = await asyncio.gather(
         _find_most_related_text_unit_from_entities(
-            node_datas, query_param, text_chunks_db, knowledge_graph_inst
+            node_datas, edges_map, query_param, text_chunks_db, knowledge_graph_inst
         ),
         _find_most_related_edges_from_entities(
-            node_datas, query_param, knowledge_graph_inst
+            node_datas, edges_map, query_param, knowledge_graph_inst
         ),
     )
 
+    # Truncate node data if needed
     len_node_datas = len(node_datas)
     node_datas = truncate_list_by_token_size(
         node_datas,
@@ -1305,10 +1367,10 @@ async def _get_node_data(
         entites_section_list.append(
             [
                 i,
-                n["entity_name"],
+                n.get("entity_name", f"Entity-{i}"),
                 n.get("entity_type", "UNKNOWN"),
                 n.get("description", "UNKNOWN"),
-                n["rank"],
+                n.get("rank", 0),
                 created_at,
                 file_path,
             ]
@@ -1342,10 +1404,10 @@ async def _get_node_data(
                 i,
                 e["src_tgt"][0],
                 e["src_tgt"][1],
-                e["description"],
-                e["keywords"],
-                e["weight"],
-                e["rank"],
+                e.get("description", ""),   # Use get with default
+                e.get("keywords", ""),      # Use get with default
+                e.get("weight", 1.0),       # Use get with default
+                e.get("rank", 0),           # Use get with default
                 created_at,
                 file_path,
             ]
@@ -1354,143 +1416,193 @@ async def _get_node_data(
 
     text_units_section_list = [["id", "content", "file_path"]]
     for i, t in enumerate(use_text_units):
-        text_units_section_list.append(
-            [i, t["content"], t.get("file_path", "unknown_source")]
-        )
+        if not isinstance(t, dict):
+            logger.warning(f"Invalid text unit at index {i}, skipping")
+            continue
+        # Make sure content is available
+        if "content" not in t:
+            t["content"] = f"No content available for unit {i}"
+        text_units_section_list.append([i, t["content"], t.get("file_path", "unknown")])
     text_units_context = list_of_list_to_csv(text_units_section_list)
     return entities_context, relations_context, text_units_context
 
 
 async def _find_most_related_text_unit_from_entities(
     node_datas: list[dict],
+    edges_map: dict[str, list[tuple]],
     query_param: QueryParam,
     text_chunks_db: BaseKVStorage,
     knowledge_graph_inst: BaseGraphStorage,
 ):
-    text_units = [
-        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
-        for dp in node_datas
-    ]
-    edges = await asyncio.gather(
-        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
-    )
-    all_one_hop_nodes = set()
-    for this_edges in edges:
-        if not this_edges:
+    # Collect all source IDs from nodes
+    all_text_unit_ids = set()
+    node_source_ids = {}
+    
+    for node in node_datas:
+        entity_name = node["entity_name"]
+        
+        # Make sure source_id exists even if it's empty
+        if "source_id" not in node:
+            node["source_id"] = "unknown"
+            logger.warning(f"Missing source_id for entity {entity_name}, using 'unknown'")
+            
+        source_id = node.get("source_id", "")
+        if source_id:
+            chunk_ids = source_id.split(GRAPH_FIELD_SEP)
+            node_source_ids[entity_name] = set(chunk_ids)
+            all_text_unit_ids.update(chunk_ids)
+    
+    # Collect all one-hop neighbors from edges
+    one_hop_entities = set()
+    for entity_name, edges in edges_map.items():
+        for src, tgt in edges:
+            # Add the target if source is this entity
+            if src == entity_name:
+                one_hop_entities.add(tgt)
+            # Add the source if target is this entity
+            elif tgt == entity_name:
+                one_hop_entities.add(src)
+    
+    # Get data for one-hop entities in batch
+    one_hop_nodes = await knowledge_graph_inst.get_nodes_batch(list(one_hop_entities))
+    
+    # Build one-hop source IDs map
+    one_hop_source_ids = {}
+    for entity_name, node_data in one_hop_nodes.items():
+        if node_data:
+            # Make sure source_id exists
+            if "source_id" not in node_data:
+                node_data["source_id"] = "unknown"
+                logger.warning(f"Missing source_id for one-hop entity {entity_name}, using 'unknown'")
+                
+            source_id = node_data.get("source_id", "")
+            if source_id:
+                chunk_ids = source_id.split(GRAPH_FIELD_SEP)
+                one_hop_source_ids[entity_name] = set(chunk_ids)
+                all_text_unit_ids.update(chunk_ids)
+    
+    # Get chunks in batch
+    chunk_ids_list = list(all_text_unit_ids)
+    chunks = await text_chunks_db.get_by_ids(chunk_ids_list)
+    
+    # Build chunk data with metrics
+    chunk_data = {}
+    for chunk_id, chunk in zip(chunk_ids_list, chunks):
+        if chunk and "content" in chunk:
+            # Initialize with lowest priority
+            chunk_data[chunk_id] = {
+                "data": chunk,
+                "order": float('inf'),
+                "relation_counts": 0
+            }
+    
+    # Update chunks with node ordering
+    for entity_idx, node in enumerate(node_datas):
+        entity_name = node["entity_name"]
+        if entity_name in node_source_ids:
+            for chunk_id in node_source_ids[entity_name]:
+                if chunk_id in chunk_data:
+                    # Use entity index as order (lower is better)
+                    chunk_data[chunk_id]["order"] = min(chunk_data[chunk_id]["order"], entity_idx)
+    
+    # Count relations for each chunk
+    for entity_name, edges in edges_map.items():
+        if entity_name not in node_source_ids:
             continue
-        all_one_hop_nodes.update([e[1] for e in this_edges])
-
-    all_one_hop_nodes = list(all_one_hop_nodes)
-    all_one_hop_nodes_data = await asyncio.gather(
-        *[knowledge_graph_inst.get_node(e) for e in all_one_hop_nodes]
-    )
-
-    # Add null check for node data
-    all_one_hop_text_units_lookup = {
-        k: set(split_string_by_multi_markers(v["source_id"], [GRAPH_FIELD_SEP]))
-        for k, v in zip(all_one_hop_nodes, all_one_hop_nodes_data)
-        if v is not None and "source_id" in v  # Add source_id check
-    }
-
-    all_text_units_lookup = {}
-    tasks = []
-
-    for index, (this_text_units, this_edges) in enumerate(zip(text_units, edges)):
-        for c_id in this_text_units:
-            if c_id not in all_text_units_lookup:
-                all_text_units_lookup[c_id] = index
-                tasks.append((c_id, index, this_edges))
-
-    results = await asyncio.gather(
-        *[text_chunks_db.get_by_id(c_id) for c_id, _, _ in tasks]
-    )
-
-    for (c_id, index, this_edges), data in zip(tasks, results):
-        all_text_units_lookup[c_id] = {
-            "data": data,
-            "order": index,
-            "relation_counts": 0,
-        }
-
-        if this_edges:
-            for e in this_edges:
-                if (
-                    e[1] in all_one_hop_text_units_lookup
-                    and c_id in all_one_hop_text_units_lookup[e[1]]
-                ):
-                    all_text_units_lookup[c_id]["relation_counts"] += 1
-
-    # Filter out None values and ensure data has content
+            
+        entity_chunks = node_source_ids[entity_name]
+        
+        for src, tgt in edges:
+            target_entity = tgt if src == entity_name else src
+            if target_entity in one_hop_source_ids:
+                target_chunks = one_hop_source_ids[target_entity]
+                
+                # Increment relation count for chunks that appear in both entities
+                common_chunks = entity_chunks.intersection(target_chunks)
+                for chunk_id in common_chunks:
+                    if chunk_id in chunk_data:
+                        chunk_data[chunk_id]["relation_counts"] += 1
+    
+    # Convert to list and sort
     all_text_units = [
         {"id": k, **v}
-        for k, v in all_text_units_lookup.items()
-        if v is not None and v.get("data") is not None and "content" in v["data"]
+        for k, v in chunk_data.items()
     ]
-
-    if not all_text_units:
-        logger.warning("No valid text units found")
-        return []
-
-    all_text_units = sorted(
-        all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
-    )
-
+    
+    all_text_units.sort(key=lambda x: (x["order"], -x["relation_counts"]))
+    
+    # Truncate to max token size
     all_text_units = truncate_list_by_token_size(
         all_text_units,
         key=lambda x: x["data"]["content"],
         max_token_size=query_param.max_token_for_text_unit,
     )
-
+    
     logger.debug(
-        f"Truncate chunks from {len(all_text_units_lookup)} to {len(all_text_units)} (max tokens:{query_param.max_token_for_text_unit})"
+        f"Truncate chunks from {len(chunk_data)} to {len(all_text_units)} (max tokens:{query_param.max_token_for_text_unit})"
     )
-
-    all_text_units = [t["data"] for t in all_text_units]
-    return all_text_units
+    
+    return [t["data"] for t in all_text_units]
 
 
 async def _find_most_related_edges_from_entities(
     node_datas: list[dict],
+    edges_map: dict[str, list[tuple]],
     query_param: QueryParam,
     knowledge_graph_inst: BaseGraphStorage,
 ):
-    all_related_edges = await asyncio.gather(
-        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
-    )
-    all_edges = []
+    all_edges = set()
     seen = set()
-
-    for this_edges in all_related_edges:
-        for e in this_edges:
-            sorted_edge = tuple(sorted(e))
+    
+    # Collect all edges from edges_map
+    for entity_name, edges in edges_map.items():
+        for edge in edges:
+            sorted_edge = tuple(sorted(edge))
             if sorted_edge not in seen:
                 seen.add(sorted_edge)
-                all_edges.append(sorted_edge)
+                all_edges.add(edge)
+    
+    # Get all edge data in batch
+    edge_pairs = list(all_edges)
+    edges_data_map = await knowledge_graph_inst.get_edges_batch(edge_pairs)
+    
+    # Get edge degrees in batch if available
+    if hasattr(knowledge_graph_inst, 'get_edge_degrees_batch'):
+        edge_degrees_map = await knowledge_graph_inst.get_edge_degrees_batch(edge_pairs)
+    else:
+        # Fallback to parallel execution of individual calls
+        degrees = await asyncio.gather(
+            *[knowledge_graph_inst.edge_degree(src, tgt) for src, tgt in edge_pairs]
+        )
+        edge_degrees_map = {edge: degree for edge, degree in zip(edge_pairs, degrees)}
+    
+    # Process edge data
+    all_edges_data = []
+    for edge in edge_pairs:
+        edge_data = edges_data_map.get(edge)
+        if edge_data:
+            if "description" not in edge_data:
+                edge_data["description"] = ""
 
-    all_edges_pack, all_edges_degree = await asyncio.gather(
-        asyncio.gather(*[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]),
-        asyncio.gather(
-            *[knowledge_graph_inst.edge_degree(e[0], e[1]) for e in all_edges]
-        ),
-    )
-    all_edges_data = [
-        {"src_tgt": k, "rank": d, **v}
-        for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
-        if v is not None
-    ]
-    all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
-    )
+            all_edges_data.append({
+                "src_tgt": edge,
+                "rank": edge_degrees_map.get(edge, 0),
+                **edge_data
+            })
+    
+    # Sort and truncate
+    all_edges_data.sort(key=lambda x: (x["rank"], x.get("weight", 0)), reverse=True)
+    
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
         key=lambda x: x["description"] if x["description"] is not None else "",
         max_token_size=query_param.max_token_for_global_context,
     )
-
+    
     logger.debug(
-        f"Truncate relations from {len(all_edges)} to {len(all_edges_data)} (max tokens:{query_param.max_token_for_global_context})"
+        f"Truncate relations from {len(edge_pairs)} to {len(all_edges_data)} (max tokens:{query_param.max_token_for_global_context})"
     )
-
+    
     return all_edges_data
 
 
@@ -1512,37 +1624,66 @@ async def _get_edge_data(
     if not len(results):
         return "", "", ""
 
-    edge_datas, edge_degree = await asyncio.gather(
-        asyncio.gather(
+    # Extract all edge pairs
+    edge_pairs = [(r["src_id"], r["tgt_id"]) for r in results]
+    
+    # Use batch operations for edge data and degrees
+    edges_data_map = None
+    edge_degrees_map = None
+    
+    # Use batch methods if available, otherwise fall back to individual calls
+    if hasattr(knowledge_graph_inst, 'get_edges_batch'):
+        edges_data_map = await knowledge_graph_inst.get_edges_batch(edge_pairs)
+    else:
+        edge_data_list = await asyncio.gather(
             *[knowledge_graph_inst.get_edge(r["src_id"], r["tgt_id"]) for r in results]
-        ),
-        asyncio.gather(
-            *[
-                knowledge_graph_inst.edge_degree(r["src_id"], r["tgt_id"])
-                for r in results
-            ]
-        ),
-    )
+        )
+        edges_data_map = {pair: data for pair, data in zip(edge_pairs, edge_data_list)}
+    
+    if hasattr(knowledge_graph_inst, 'get_edge_degrees_batch'):
+        edge_degrees_map = await knowledge_graph_inst.get_edge_degrees_batch(edge_pairs)
+    else:
+        edge_degree_list = await asyncio.gather(
+            *[knowledge_graph_inst.edge_degree(r["src_id"], r["tgt_id"]) for r in results]
+        )
+        edge_degrees_map = {pair: degree for pair, degree in zip(edge_pairs, edge_degree_list)}
 
-    edge_datas = [
-        {
-            "src_id": k["src_id"],
-            "tgt_id": k["tgt_id"],
-            "rank": d,
-            "created_at": k.get("__created_at__", None),
-            **v,
-        }
-        for k, v, d in zip(results, edge_datas, edge_degree)
-        if v is not None
-    ]
+    # Process edge data
+    edge_datas = []
+    for result, edge_pair in zip(results, edge_pairs):
+        edge_data = edges_data_map.get(edge_pair)
+        if edge_data is not None:
+            # Create edge data with defaults for required fields
+            edge_info = {
+                "src_id": result["src_id"],
+                "tgt_id": result["tgt_id"],
+                "rank": edge_degrees_map.get(edge_pair, 0),
+                "created_at": result.get("__created_at__", None),
+                # Add missing required fields with defaults
+                "description": "",
+                "keywords": "",
+                "weight": 1.0,
+                "source_id": "unknown",
+                "file_path": "unknown",
+            }
+            
+            # Update with actual edge data if available
+            if edge_data:
+                edge_info.update(edge_data)
+                
+            edge_datas.append(edge_info)
+    
+    # Sort and process as before
     edge_datas = sorted(
-        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        edge_datas, key=lambda x: (x["rank"], x.get("weight", 0)), reverse=True
     )
     edge_datas = truncate_list_by_token_size(
         edge_datas,
-        key=lambda x: x["description"] if x["description"] is not None else "",
+        key=lambda x: x.get("description", "") if x.get("description") is not None else "",
         max_token_size=query_param.max_token_for_global_context,
     )
+    
+    # Rest of the function remains the same...
     use_entities, use_text_units = await asyncio.gather(
         _find_most_related_entities_from_relationships(
             edge_datas, query_param, knowledge_graph_inst
@@ -1582,10 +1723,10 @@ async def _get_edge_data(
                 i,
                 e["src_id"],
                 e["tgt_id"],
-                e["description"],
-                e["keywords"],
-                e["weight"],
-                e["rank"],
+                e.get("description", ""),  # Use get with default
+                e.get("keywords", ""),     # Use get with default
+                e.get("weight", 1.0),      # Use get with default
+                e.get("rank", 0),          # Use get with default
                 created_at,
                 file_path,
             ]
@@ -1607,10 +1748,10 @@ async def _get_edge_data(
         entites_section_list.append(
             [
                 i,
-                n["entity_name"],
+                n.get("entity_name", f"Entity-{i}"),
                 n.get("entity_type", "UNKNOWN"),
                 n.get("description", "UNKNOWN"),
-                n["rank"],
+                n.get("rank", 0),
                 created_at,
                 file_path,
             ]
@@ -1619,6 +1760,12 @@ async def _get_edge_data(
 
     text_units_section_list = [["id", "content", "file_path"]]
     for i, t in enumerate(use_text_units):
+        if not isinstance(t, dict):
+            logger.warning(f"Invalid text unit at index {i}, skipping")
+            continue
+        # Make sure content is available
+        if "content" not in t:
+            t["content"] = f"No content available for unit {i}"
         text_units_section_list.append([i, t["content"], t.get("file_path", "unknown")])
     text_units_context = list_of_list_to_csv(text_units_section_list)
     return entities_context, relations_context, text_units_context
@@ -1632,6 +1779,7 @@ async def _find_most_related_entities_from_relationships(
     entity_names = []
     seen = set()
 
+    # Collect unique entity names
     for e in edge_datas:
         if e["src_id"] not in seen:
             entity_names.append(e["src_id"])
@@ -1640,25 +1788,46 @@ async def _find_most_related_entities_from_relationships(
             entity_names.append(e["tgt_id"])
             seen.add(e["tgt_id"])
 
-    node_datas, node_degrees = await asyncio.gather(
-        asyncio.gather(
-            *[
-                knowledge_graph_inst.get_node(entity_name)
-                for entity_name in entity_names
-            ]
-        ),
-        asyncio.gather(
-            *[
-                knowledge_graph_inst.node_degree(entity_name)
-                for entity_name in entity_names
-            ]
-        ),
-    )
-    node_datas = [
-        {**n, "entity_name": k, "rank": d}
-        for k, n, d in zip(entity_names, node_datas, node_degrees)
-    ]
+    # Use batch operations if available
+    nodes_map = None
+    node_degrees_map = None
+    
+    if hasattr(knowledge_graph_inst, 'get_nodes_batch'):
+        nodes_map = await knowledge_graph_inst.get_nodes_batch(entity_names)
+    else:
+        node_data_list = await asyncio.gather(
+            *[knowledge_graph_inst.get_node(entity_name) for entity_name in entity_names]
+        )
+        nodes_map = {name: data for name, data in zip(entity_names, node_data_list)}
+    
+    if hasattr(knowledge_graph_inst, 'get_node_degrees_batch'):
+        node_degrees_map = await knowledge_graph_inst.get_node_degrees_batch(entity_names)
+    else:
+        node_degree_list = await asyncio.gather(
+            *[knowledge_graph_inst.node_degree(entity_name) for entity_name in entity_names]
+        )
+        node_degrees_map = {name: degree for name, degree in zip(entity_names, node_degree_list)}
 
+    # Process node data
+    node_datas = []
+    for entity_name in entity_names:
+        node_data = nodes_map.get(entity_name)
+        if node_data is not None:
+            # Ensure all required fields are present
+            entity_data = {
+                "entity_name": entity_name,
+                "entity_type": "UNKNOWN",
+                "description": "",
+                "source_id": "unknown",
+                "file_path": "unknown_source",
+                "rank": node_degrees_map.get(entity_name, 0)
+            }
+            # Override defaults with actual data
+            if isinstance(node_data, dict):
+                entity_data.update(node_data)
+            node_datas.append(entity_data)
+
+    # Truncate as before
     len_node_datas = len(node_datas)
     node_datas = truncate_list_by_token_size(
         node_datas,
@@ -1678,10 +1847,19 @@ async def _find_related_text_unit_from_relationships(
     text_chunks_db: BaseKVStorage,
     knowledge_graph_inst: BaseGraphStorage,
 ):
-    text_units = [
-        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
-        for dp in edge_datas
-    ]
+    text_units = []
+    for dp in edge_datas:
+        # Make sure source_id exists
+        if "source_id" not in dp:
+            dp["source_id"] = "unknown"
+            logger.warning(f"Missing source_id for edge {dp.get('src_id', 'unknown')} -> {dp.get('tgt_id', 'unknown')}, using 'unknown'")
+        
+        # Now safely access source_id
+        source_id = dp.get("source_id", "")
+        if source_id:
+            text_units.append(split_string_by_multi_markers(source_id, [GRAPH_FIELD_SEP]))
+        else:
+            text_units.append(["unknown"])
     all_text_units_lookup = {}
 
     async def fetch_chunk_data(c_id, index):
@@ -1703,6 +1881,7 @@ async def _find_related_text_unit_from_relationships(
 
     if not all_text_units_lookup:
         logger.warning("No valid text chunks found")
+        # Return empty list - process will handle empty results gracefully
         return []
 
     all_text_units = [{"id": k, **v} for k, v in all_text_units_lookup.items()]
@@ -1714,8 +1893,18 @@ async def _find_related_text_unit_from_relationships(
     ]
 
     if not valid_text_units:
-        logger.warning("No valid text chunks after filtering")
-        return []
+        logger.warning("No valid text chunks after filtering, creating a placeholder")
+        # Instead of returning empty list, return a placeholder text chunk
+        dummy_data = {
+            "id": "placeholder",
+            "data": {
+                "content": "No text content available for this search",
+                "file_path": "unknown"
+            },
+            "order": 0,
+            "relation_counts": 0
+        }
+        return [dummy_data["data"]]
 
     truncated_text_units = truncate_list_by_token_size(
         valid_text_units,
@@ -1730,7 +1919,6 @@ async def _find_related_text_unit_from_relationships(
     all_text_units: list[TextChunkSchema] = [t["data"] for t in truncated_text_units]
 
     return all_text_units
-
 
 def combine_contexts(entities, relationships, sources):
     # Function to extract entities, relationships, and sources from context strings
