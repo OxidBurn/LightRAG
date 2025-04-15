@@ -1902,20 +1902,35 @@ class PGGraphStorage(BaseGraphStorage):
         if cache_key in self._node_cache:
             self._cache_hits += 1
             return self._node_cache[cache_key]
-            
-        self._cache_misses += 1
-        result = await self._get_node_impl(node_id)
-        
-        # Manage cache size
-        if len(self._node_cache) >= self._max_cache_size:
-            # Remove oldest 10% of entries
-            remove_count = max(1, self._max_cache_size // 10)
-            for _ in range(remove_count):
-                if self._node_cache:
-                    self._node_cache.pop(next(iter(self._node_cache)), None)
                 
-        self._node_cache[cache_key] = result
-        return result
+        self._cache_misses += 1
+        
+        try:
+            label = self._encode_graph_label(node_id.strip('"'))
+            
+            query = """SELECT * FROM cypher('%s', $$
+                        MATCH (n:Entity {node_id: "%s"})
+                        RETURN n
+                    $$) AS (n agtype)""" % (self.graph_name, label)
+            
+            record = await self._query(query)
+            
+            result = None
+            if record and len(record) > 0 and "n" in record[0]:
+                node_dict = record[0]["n"]
+                result = node_dict
+            
+            if len(self._node_cache) >= self._max_cache_size:
+                remove_count = max(1, self._max_cache_size // 10)
+                for _ in range(remove_count):
+                    if self._node_cache:
+                        self._node_cache.pop(next(iter(self._node_cache)), None)
+                    
+            self._node_cache[cache_key] = result
+            return result
+        except Exception as e:
+            logger.error(f"Error getting node {node_id}: {e}")
+            return None
 
     async def node_degree(self, node_id: str) -> int:
         try:
