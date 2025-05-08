@@ -1618,7 +1618,7 @@ async def _find_most_related_edges_from_entities(
 
     tokenizer: Tokenizer = knowledge_graph_inst.global_config.get("tokenizer")
     all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        all_edges_data, key=lambda x: (x["rank"], x.get("weight", 0.0)), reverse=True
     )
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
@@ -1682,7 +1682,7 @@ async def _get_edge_data(
 
     tokenizer: Tokenizer = text_chunks_db.global_config.get("tokenizer")
     edge_datas = sorted(
-        edge_datas, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        edge_datas, key=lambda x: (x["rank"], x.get("weight", 0.0)), reverse=True
     )
     edge_datas = truncate_list_by_token_size(
         edge_datas,
