@@ -1398,7 +1398,7 @@ async def _get_node_data(
     len_node_datas = len(node_datas)
     node_datas = truncate_list_by_token_size(
         node_datas,
-        key=lambda x: x["description"] if x["description"] is not None else "",
+        key=lambda x: x.get("description", "UNKNOWN"),
         max_token_size=query_param.max_token_for_local_context,
         tokenizer=tokenizer,
     )
@@ -1447,9 +1447,9 @@ async def _get_node_data(
                 "id": i + 1,
                 "entity1": e["src_tgt"][0],
                 "entity2": e["src_tgt"][1],
-                "description": e["description"],
-                "keywords": e["keywords"],
-                "weight": e["weight"],
+                "description": e.get("description", "UNKNOWN"),
+                "keywords": e.get("keywords", "UNKNOWN"),
+                "weight": e.get("weight", 0),
                 "rank": e["rank"],
                 "created_at": created_at,
                 "file_path": file_path,
@@ -1622,7 +1622,7 @@ async def _find_most_related_edges_from_entities(
     )
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
-        key=lambda x: x["description"] if x["description"] is not None else "",
+        key=lambda x: x.get("description", "UNKNOWN"),
         max_token_size=query_param.max_token_for_global_context,
         tokenizer=tokenizer,
     )
@@ -1686,7 +1686,7 @@ async def _get_edge_data(
     )
     edge_datas = truncate_list_by_token_size(
         edge_datas,
-        key=lambda x: x["description"] if x["description"] is not None else "",
+        key=lambda x: x.get("description", "UNKNOWN"),
         max_token_size=query_param.max_token_for_global_context,
         tokenizer=tokenizer,
     )
@@ -1722,9 +1722,9 @@ async def _get_edge_data(
                 "id": i + 1,
                 "entity1": e["src_id"],
                 "entity2": e["tgt_id"],
-                "description": e["description"],
-                "keywords": e["keywords"],
-                "weight": e["weight"],
+                "description": e.get("description", "UNKNOWN"),
+                "keywords": e.get("keywords", "UNKNOWN"),
+                "weight": e.get("weight", 0),
                 "rank": e["rank"],
                 "created_at": created_at,
                 "file_path": file_path,
@@ -1803,7 +1803,7 @@ async def _find_most_related_entities_from_relationships(
     len_node_datas = len(node_datas)
     node_datas = truncate_list_by_token_size(
         node_datas,
-        key=lambda x: x["description"] if x["description"] is not None else "",
+        key=lambda x: x.get("description", "UNKNOWN"),
         max_token_size=query_param.max_token_for_local_context,
         tokenizer=tokenizer,
     )
@@ -1821,9 +1821,9 @@ async def _find_related_text_unit_from_relationships(
     knowledge_graph_inst: BaseGraphStorage,
 ):
     text_units = [
-        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        split_string_by_multi_markers(dp.get("source_id", ""), [GRAPH_FIELD_SEP])
         for dp in edge_datas
-        if dp["source_id"] is not None
+        if dp.get("source_id") is not None
     ]
     all_text_units_lookup = {}
 
