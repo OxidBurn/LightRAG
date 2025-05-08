@@ -22,7 +22,6 @@ from lightrag.constants import (
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_FILENAME,
 )
-from lightrag.api.config import get_env_value
 
 # Use TYPE_CHECKING to avoid circular imports
 if TYPE_CHECKING:
