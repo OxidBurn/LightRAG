@@ -1419,10 +1419,6 @@ class PGGraphStorage(BaseGraphStorage):
                 for key, default_value in required_keys.items():
                     if key not in result:
                         result[key] = default_value
-                        logger.warning(
-                            f"Edge between {source_node_id} and {target_node_id} "
-                            f"missing {key}, using default: {default_value}"
-                        )
 
                 return result
         except Exception as e:
@@ -1823,7 +1819,6 @@ class PGGraphStorage(BaseGraphStorage):
                 for key, default_value in required_keys.items():
                     if key not in edge_props:
                         edge_props[key] = default_value
-                        logger.warning(f"missing {key}, using default: {default_value}")
 
                 edges_dict[(result["source"], result["target"])] = edge_props
 
@@ -1852,7 +1847,6 @@ class PGGraphStorage(BaseGraphStorage):
                 for key, default_value in required_keys.items():
                     if key not in edge_props:
                         edge_props[key] = default_value
-                        logger.warning(f"missing {key}, using default: {default_value}")
 
                 edges_dict[(result["source"], result["target"])] = edge_props
 
