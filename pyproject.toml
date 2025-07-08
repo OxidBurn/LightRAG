@@ -83,7 +83,7 @@ Repository = "https://github.com/HKUDS/LightRAG"
 "Bug Tracker" = "https://github.com/HKUDS/LightRAG/issues"
 
 [tool.setuptools]
-packages = ["lightrag"]
+packages = ["lightrag", "lightrag.api", "lightrag.kg", "lightrag.llm", "lightrag.tools"]
 include-package-data = true
 
 [tool.setuptools.dynamic]
